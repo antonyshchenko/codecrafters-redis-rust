@@ -1,47 +1,55 @@
-use std::io::{BufRead, BufReader, ErrorKind, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
+use std::io;
+use std::io::{ErrorKind};
 use std::process::exit;
-use std::thread::{sleep};
-use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap_or_else(|err| {
+#[tokio::main]
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap_or_else(|err| {
         eprintln!("Failed to bind to a port: {}", err);
         exit(1);
     });
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                handle_connection(&mut stream);
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, socket_addr)) => {
+                println!("Client connected: {}", socket_addr);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(&mut stream).await {
+                        eprintln!("Error while handling connection: {}", e);
+                        let _ = stream.shutdown().await;
+                    }
+                });
             }
             Err(e) => {
-                eprintln!("error: {}", e);
+                eprintln!("Failed to accept client connection {}", e);
             }
         }
     }
 }
 
-fn handle_connection(mut stream: &TcpStream) {
+async fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
     loop {
-        let mut reader = BufReader::new(stream);
-        let mut command = String::new();
-        match reader.read_line(&mut command) {
+        stream.readable().await?;
+
+        let mut buf = Vec::new();
+
+        match stream.read_buf(&mut buf).await {
             Ok(bytes_read) => {
                 if bytes_read > 0 {
-                    if let Err(error) = stream.write("+PONG\r\n".as_bytes()) {
+                    if let Err(error) = stream.write_all(b"+PONG\r\n").await {
                         eprintln!("Error while writing response: {}", error);
-                        let _ = stream.shutdown(Shutdown::Both);
                     }
                 } else {
-                    sleep(Duration::from_millis(10))
+                    return Ok(())
                 }
             }
             Err(e) => {
                 if e.kind() != ErrorKind::ConnectionReset {
                     eprintln!("Error while reading from TCP stream {}", e);
                 }
-                return
+                return Ok(())
             }
         }
     }
