@@ -1,18 +1,25 @@
-use std::net::TcpListener;
+use std::io::Write;
+use std::net::{Shutdown, TcpListener};
+use std::process::exit;
 
 fn main() {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    println!("Logs from your program will appear here!");
-
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:6379").unwrap_or_else(|err| {
+        eprintln!("Failed to bind to a port: {}", err);
+        exit(1);
+    });
 
     for stream in listener.incoming() {
         match stream {
-            Ok(_stream) => {
-                println!("accepted new connection");
+            Ok(mut stream) => {
+                if let Err(error) = stream.write("+PONG\r\n".as_bytes()) {
+                    eprintln!("Error while writing response: {}", error);
+                    stream
+                        .shutdown(Shutdown::Both)
+                        .expect("Failed to shutdown TCP stream");
+                }
             }
             Err(e) => {
-                println!("error: {}", e);
+                eprintln!("error: {}", e);
             }
         }
     }
