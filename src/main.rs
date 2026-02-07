@@ -1,6 +1,10 @@
-use std::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use resp::RespCodec;
+use std::io::{self};
 use tokio::net::{TcpListener, TcpStream};
+
+use crate::resp::{BulkString, RespCommand};
+
+mod resp;
 
 #[tokio::main]
 async fn main() {
@@ -26,19 +30,25 @@ async fn main() {
 }
 
 async fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
+    let (reader, writer) = stream.split();
+    let mut codec = RespCodec::new(reader, writer);
+
     loop {
-        let (reader, writer) = stream.split();
-        let mut reader = BufReader::new(reader);
-        let mut writer = BufWriter::new(writer);
+        let command = match codec.read_command().await? {
+            Some(cmd) => cmd,
+            None => {
+                return Ok(());
+            }
+        };
 
-        let data = reader.fill_buf().await?.to_vec();
-        if data.is_empty() {
-            return Ok(());
+        println!("Got command {:?}", command);
+        match command {
+            RespCommand::Echo { message } => codec.write_bulk_str(message).await?,
+            RespCommand::Ping { message } => {
+                let response = message.unwrap_or_else(|| BulkString::from_str("PONG"));
+                codec.write_bulk_str(response).await?
+            }
         }
-
-        writer.write_all(b"+PONG\r\n").await?;
-        writer.flush().await?;
-
-        reader.consume(data.len());
+        codec.flush().await?;
     }
 }
