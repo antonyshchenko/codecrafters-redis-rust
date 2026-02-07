@@ -118,6 +118,12 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> RespCodec<R, W> 
         self.writer.write_all(b"\r\n").await
     }
 
+    pub async fn write_simple_str(&mut self, s: &str) -> io::Result<()> {
+        self.writer.write_u8(b'+').await?;
+        self.writer.write_all(s.as_bytes()).await?;
+        self.writer.write_all(b"\r\n").await
+    }
+
     pub async fn flush(&mut self) -> io::Result<()> {
         self.writer.flush().await
     }

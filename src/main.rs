@@ -2,7 +2,7 @@ use resp::RespCodec;
 use std::io::{self};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::resp::{BulkString, RespCommand};
+use crate::resp::RespCommand;
 
 mod resp;
 
@@ -45,8 +45,10 @@ async fn handle_connection(stream: &mut TcpStream) -> io::Result<()> {
         match command {
             RespCommand::Echo { message } => codec.write_bulk_str(message).await?,
             RespCommand::Ping { message } => {
-                let response = message.unwrap_or_else(|| BulkString::from_str("PONG"));
-                codec.write_bulk_str(response).await?
+                match message {
+                    Some(message) => codec.write_bulk_str(message).await?,
+                    None => codec.write_simple_str("PONG").await?,
+                };
             }
         }
         codec.flush().await?;
