@@ -118,6 +118,13 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> RespCodec<R, W> 
         self.writer.write_all(b"\r\n").await
     }
 
+    pub async fn write_bulk_str_opt(&mut self, bs: Option<BulkString>) -> io::Result<()> {
+        match bs {
+            Some(bs) => self.write_bulk_str(bs).await,
+            None => self.writer.write_all(b"$-1\r\n").await,
+        }
+    }
+
     pub async fn write_simple_str(&mut self, s: &str) -> io::Result<()> {
         self.writer.write_u8(b'+').await?;
         self.writer.write_all(s.as_bytes()).await?;
@@ -138,12 +145,34 @@ enum RespType {
     Array(Vec<RespType>),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BulkString(Vec<u8>);
 
 impl BulkString {
     pub fn from_str(s: &str) -> Self {
         BulkString(s.as_bytes().to_vec())
+    }
+
+    pub fn as_str(&self) -> io::Result<&str> {
+        std::str::from_utf8(&self.0).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+}
+
+struct CommandArgParser<I>(I);
+
+impl CommandArgParser<std::vec::IntoIter<RespType>> {
+    fn new(args_vec: Vec<RespType>) -> Self {
+        CommandArgParser(args_vec.into_iter())
+    }
+}
+
+impl<I: Iterator<Item = RespType>> CommandArgParser<I> {
+    fn next(&mut self) -> io::Result<BulkString> {
+        self.0.next().ok_or(invalid_command_args_err())?.try_into()
+    }
+
+    fn next_optional(&mut self) -> io::Result<Option<BulkString>> {
+        self.0.next().map(|rt| rt.try_into()).transpose()
     }
 }
 
@@ -151,6 +180,8 @@ impl BulkString {
 pub enum RespCommand {
     Echo { message: BulkString },
     Ping { message: Option<BulkString> },
+    Set { key: BulkString, value: BulkString },
+    Get { key: BulkString },
 }
 
 impl RespCommand {
@@ -164,27 +195,27 @@ impl RespCommand {
         }
     }
 
-    fn parse_from_array(mut value: Vec<RespType>) -> io::Result<Self> {
-        let command_name: &str = value
-            .first()
-            .ok_or(invalid_command_args_err())?
-            .try_into()?;
+    fn parse_from_array(value: Vec<RespType>) -> io::Result<Self> {
+        let mut args = CommandArgParser::new(value);
+
+        let command_name = args.next()?;
+        let command_name = command_name.as_str()?;
 
         if command_name.eq_ignore_ascii_case("ECHO") {
-            if value.len() != 2 {
-                return Err(invalid_command_args_err());
-            }
             Ok(RespCommand::Echo {
-                message: value.swap_remove(1).try_into()?,
+                message: args.next()?,
             })
         } else if command_name.eq_ignore_ascii_case("PING") {
             Ok(RespCommand::Ping {
-                message: match value.len() {
-                    1 => None,
-                    2 => Some(value.swap_remove(1).try_into()?),
-                    _ => Err(invalid_command_args_err())?,
-                },
+                message: args.next_optional()?,
             })
+        } else if command_name.eq_ignore_ascii_case("SET") {
+            Ok(RespCommand::Set {
+                key: args.next()?,
+                value: args.next()?,
+            })
+        } else if command_name.eq_ignore_ascii_case("GET") {
+            Ok(RespCommand::Get { key: args.next()? })
         } else {
             Err(invalid_data_err("Command parsing failed"))
         }
@@ -269,7 +300,40 @@ mod tests {
 
         assert_eq!(
             Some(RespCommand::Echo {
-                message: BulkString("hey".as_bytes().to_vec())
+                message: BulkString::from_str("hey")
+            }),
+            cmd
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_set_command() -> io::Result<()> {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n";
+        let output = Vec::new();
+        let mut codec = RespCodec::new(&input[..], output);
+        let cmd = codec.read_command().await?;
+
+        assert_eq!(
+            Some(RespCommand::Set {
+                key: BulkString::from_str("key"),
+                value: BulkString::from_str("value")
+            }),
+            cmd
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_get_command() -> io::Result<()> {
+        let input = b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n";
+        let output = Vec::new();
+        let mut codec = RespCodec::new(&input[..], output);
+        let cmd = codec.read_command().await?;
+
+        assert_eq!(
+            Some(RespCommand::Get {
+                key: BulkString::from_str("key"),
             }),
             cmd
         );
@@ -285,7 +349,7 @@ mod tests {
 
         assert_eq!(
             Some(RespCommand::Echo {
-                message: BulkString("hey".as_bytes().to_vec())
+                message: BulkString::from_str("hey")
             }),
             cmd
         );
