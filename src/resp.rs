@@ -145,7 +145,7 @@ enum RespType {
     Array(Vec<RespType>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct BulkString(Vec<u8>);
 
 impl BulkString {
@@ -178,10 +178,32 @@ impl<I: Iterator<Item = RespType>> CommandArgParser<I> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RespCommand {
-    Echo { message: BulkString },
-    Ping { message: Option<BulkString> },
-    Set { key: BulkString, value: BulkString },
-    Get { key: BulkString },
+    Echo {
+        message: BulkString,
+    },
+    Ping {
+        message: Option<BulkString>,
+    },
+    Set {
+        key: BulkString,
+        value: BulkString,
+        condition: Option<SetCmdCondition>,
+        expiry: Option<SetCmdExpiry>,
+    },
+    Get {
+        key: BulkString,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetCmdCondition {
+    UnlessKeyExists,
+    IfKeyExists,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetCmdExpiry {
+    TimeToLive { millis: u64 },
 }
 
 impl RespCommand {
@@ -210,9 +232,35 @@ impl RespCommand {
                 message: args.next_optional()?,
             })
         } else if command_name.eq_ignore_ascii_case("SET") {
+            let key = args.next()?;
+            let value = args.next()?;
+            let mut condition: Option<SetCmdCondition> = None;
+            let mut expiry: Option<SetCmdExpiry> = None;
+
+            while let Some(opt_name) = args.next_optional()? {
+                let opt_name = opt_name.as_str()?;
+                if opt_name.eq_ignore_ascii_case("XX") {
+                    condition = Some(SetCmdCondition::IfKeyExists);
+                } else if opt_name.eq_ignore_ascii_case("NX") {
+                    condition = Some(SetCmdCondition::UnlessKeyExists);
+                } else if opt_name.eq_ignore_ascii_case("PX") {
+                    let millis = args.next()?.as_str()?.parse::<u64>().map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "PX option arg must be unsigned integer",
+                        )
+                    })?;
+                    expiry = Some(SetCmdExpiry::TimeToLive { millis });
+                } else {
+                    return Err(invalid_data_err(&format!("Unexpected option {}", opt_name)));
+                }
+            }
+
             Ok(RespCommand::Set {
-                key: args.next()?,
-                value: args.next()?,
+                key,
+                value,
+                condition,
+                expiry,
             })
         } else if command_name.eq_ignore_ascii_case("GET") {
             Ok(RespCommand::Get { key: args.next()? })
@@ -317,7 +365,9 @@ mod tests {
         assert_eq!(
             Some(RespCommand::Set {
                 key: BulkString::from_str("key"),
-                value: BulkString::from_str("value")
+                value: BulkString::from_str("value"),
+                condition: None,
+                expiry: None,
             }),
             cmd
         );
