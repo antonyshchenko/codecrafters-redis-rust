@@ -1,3 +1,4 @@
+use crate::error::Error;
 use std::io::{self};
 use std::pin::Pin;
 use tokio::io::{
@@ -131,6 +132,26 @@ impl<R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send> RespCodec<R, W> 
         self.writer.write_all(b"\r\n").await
     }
 
+    pub async fn write_err(&mut self, err: Error) -> io::Result<()> {
+        self.writer.write_u8(b'-').await?;
+        self.writer
+            .write_all(
+                match err {
+                    Error::WrongType(msg) => format!("WRONGTYPE {msg}"),
+                    Error::Generic(msg) => format!("ERR {msg}"),
+                }
+                .as_bytes(),
+            )
+            .await?;
+        self.writer.write_all(b"\r\n").await
+    }
+
+    pub async fn write_usize(&mut self, i: usize) -> io::Result<()> {
+        self.writer.write_u8(b':').await?;
+        self.writer.write_all(i.to_string().as_bytes()).await?;
+        self.writer.write_all(b"\r\n").await
+    }
+
     pub async fn flush(&mut self) -> io::Result<()> {
         self.writer.flush().await
     }
@@ -192,6 +213,10 @@ pub enum RespCommand {
     },
     Get {
         key: BulkString,
+    },
+    RPush {
+        key: BulkString,
+        elements: Vec<BulkString>,
     },
 }
 
@@ -264,6 +289,19 @@ impl RespCommand {
             })
         } else if command_name.eq_ignore_ascii_case("GET") {
             Ok(RespCommand::Get { key: args.next()? })
+        } else if command_name.eq_ignore_ascii_case("RPUSH") {
+            let key = args.next()?;
+            let mut elements = Vec::new();
+
+            while let Some(element) = args.next_optional()? {
+                elements.push(element);
+            }
+
+            if elements.is_empty() {
+                return Err(invalid_data_err("At least one element must be provided"));
+            }
+
+            Ok(RespCommand::RPush { key, elements })
         } else {
             Err(invalid_data_err("Command parsing failed"))
         }

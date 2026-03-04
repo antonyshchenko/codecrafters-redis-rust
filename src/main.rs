@@ -7,6 +7,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, interval_at};
 
+mod error;
 mod resp;
 mod store;
 
@@ -103,10 +104,14 @@ async fn handle_connection(stream: &mut TcpStream, store: Store) -> io::Result<(
                 }
                 codec.write_simple_str("OK").await?;
             }
-            RespCommand::Get { key } => {
-                let value = store.get(&key);
-                codec.write_bulk_str_opt(value).await?
-            }
+            RespCommand::Get { key } => match store.get(&key) {
+                Ok(value) => codec.write_bulk_str_opt(value).await?,
+                Err(err) => codec.write_err(err).await?,
+            },
+            RespCommand::RPush { key, elements } => match store.append_to_list(key, elements) {
+                Ok(list_size) => codec.write_usize(list_size).await?,
+                Err(err) => codec.write_err(err).await?,
+            },
         }
         codec.flush().await?;
     }

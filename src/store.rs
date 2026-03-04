@@ -2,15 +2,20 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use tokio::time::Instant;
 
+use crate::error::{Error, OPERATION_ON_WRONG_TYPE};
 use crate::resp::BulkString;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex};
 
 type Key = BulkString;
 
-#[derive(Clone)]
+enum Value {
+    String(BulkString),
+    List(Vec<BulkString>),
+}
+
 struct ValueWithTtl {
-    value: BulkString,
+    value: Value,
     expires_at: Option<Instant>,
 }
 
@@ -39,8 +44,13 @@ impl StoreState {
     }
 
     fn set(&mut self, key: Key, value: BulkString, expires_at: Option<Instant>) {
-        self.data
-            .insert(key.clone(), ValueWithTtl { value, expires_at });
+        self.data.insert(
+            key.clone(),
+            ValueWithTtl {
+                value: Value::String(value),
+                expires_at,
+            },
+        );
         self.add_key_expiry(key, expires_at);
     }
 
@@ -50,13 +60,15 @@ impl StoreState {
                 .expires_at
                 .is_none_or(|expires_at| expires_at >= Instant::now())
         }) {
-            existing_value.value = value;
+            existing_value.value = Value::String(value);
             existing_value.expires_at = expires_at;
             self.add_key_expiry(key, expires_at);
         }
     }
 
     fn set_unless_exists(&mut self, key: Key, value: BulkString, expires_at: Option<Instant>) {
+        let value = Value::String(value);
+
         match self.data.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 let existing_value = entry.get_mut();
@@ -77,7 +89,7 @@ impl StoreState {
         };
     }
 
-    fn get(&self, key: &Key) -> Option<BulkString> {
+    fn get(&self, key: &Key) -> Result<Option<BulkString>, Error> {
         self.data
             .get(key)
             .take_if(|existing_value| {
@@ -85,7 +97,11 @@ impl StoreState {
                     .expires_at
                     .is_none_or(|expires_at| expires_at >= Instant::now())
             })
-            .map(|value_with_ttl| value_with_ttl.value.clone())
+            .map(|value_with_ttl| match &value_with_ttl.value {
+                Value::String(value) => Ok(value.clone()),
+                Value::List(_) => Err(OPERATION_ON_WRONG_TYPE),
+            })
+            .transpose()
     }
 
     fn add_key_expiry(&mut self, key: Key, expires_at: Option<Instant>) {
@@ -93,6 +109,29 @@ impl StoreState {
             self.expiring_keys_queue
                 .push(Reverse(KeyExpiry { expires_at, key }));
         }
+    }
+
+    fn append_to_list(&mut self, key: Key, mut elements: Vec<BulkString>) -> Result<usize, Error> {
+        Ok(match self.data.entry(key) {
+            Entry::Occupied(mut entry) => {
+                let existing_value_with_ttl = entry.get_mut();
+                match existing_value_with_ttl.value {
+                    Value::String(_) => Err(OPERATION_ON_WRONG_TYPE)?,
+                    Value::List(ref mut list) => {
+                        list.append(&mut elements);
+                        list.len()
+                    }
+                }
+            }
+            Entry::Vacant(entry) => {
+                let elements_len = elements.len();
+                entry.insert(ValueWithTtl {
+                    value: Value::List(elements),
+                    expires_at: None,
+                });
+                elements_len
+            }
+        })
     }
 
     fn vacuum(&mut self) {
@@ -154,8 +193,12 @@ impl Store {
             .set_unless_exists(key, value, expires_at);
     }
 
-    pub fn get(&self, key: &Key) -> Option<BulkString> {
+    pub fn get(&self, key: &Key) -> Result<Option<BulkString>, Error> {
         self.state.lock().unwrap().get(key)
+    }
+
+    pub fn append_to_list(&self, key: Key, elements: Vec<BulkString>) -> Result<usize, Error> {
+        self.state.lock().unwrap().append_to_list(key, elements)
     }
 
     pub fn vacuum(&self) {
@@ -171,7 +214,7 @@ mod tests {
     #[test]
     fn test_get_set() {
         let store = Store::new();
-        assert_eq!(None, store.get(&BulkString::from_str("key")));
+        assert_eq!(Ok(None), store.get(&BulkString::from_str("key")));
 
         store.set(
             BulkString::from_str("key"),
@@ -180,7 +223,7 @@ mod tests {
         );
 
         assert_eq!(
-            Some(BulkString::from_str("value")),
+            Ok(Some(BulkString::from_str("value"))),
             store.get(&BulkString::from_str("key"))
         );
 
@@ -191,7 +234,7 @@ mod tests {
         );
 
         assert_eq!(
-            Some(BulkString::from_str("value2")),
+            Ok(Some(BulkString::from_str("value2"))),
             store.get(&BulkString::from_str("key"))
         );
     }
@@ -205,7 +248,7 @@ mod tests {
             BulkString::from_str("value"),
             None,
         );
-        assert_eq!(None, store.get(&BulkString::from_str("key")));
+        assert_eq!(Ok(None), store.get(&BulkString::from_str("key")));
 
         store.set(
             BulkString::from_str("key"),
@@ -220,7 +263,7 @@ mod tests {
         );
 
         assert_eq!(
-            Some(BulkString::from_str("value2")),
+            Ok(Some(BulkString::from_str("value2"))),
             store.get(&BulkString::from_str("key"))
         );
     }
@@ -235,7 +278,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            Some(BulkString::from_str("value")),
+            Ok(Some(BulkString::from_str("value"))),
             store.get(&BulkString::from_str("key"))
         );
 
@@ -245,7 +288,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            Some(BulkString::from_str("value")),
+            Ok(Some(BulkString::from_str("value"))),
             store.get(&BulkString::from_str("key"))
         );
     }
@@ -255,7 +298,7 @@ mod tests {
         tokio::time::pause();
 
         let store = Store::new();
-        assert_eq!(None, store.get(&BulkString::from_str("key")));
+        assert_eq!(Ok(None), store.get(&BulkString::from_str("key")));
 
         store.set(
             BulkString::from_str("key"),
@@ -264,13 +307,13 @@ mod tests {
         );
 
         assert_eq!(
-            Some(BulkString::from_str("value")),
+            Ok(Some(BulkString::from_str("value"))),
             store.get(&BulkString::from_str("key"))
         );
 
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        assert_eq!(None, store.get(&BulkString::from_str("key")));
+        assert_eq!(Ok(None), store.get(&BulkString::from_str("key")));
 
         store.set(
             BulkString::from_str("key"),
@@ -297,14 +340,14 @@ mod tests {
         );
 
         assert_eq!(
-            Some(BulkString::from_str("value2")),
+            Ok(Some(BulkString::from_str("value2"))),
             store.get(&BulkString::from_str("key"))
         );
 
         tokio::time::advance(Duration::from_secs(1)).await;
 
         assert_eq!(
-            Some(BulkString::from_str("value2")),
+            Ok(Some(BulkString::from_str("value2"))),
             store.get(&BulkString::from_str("key"))
         );
 
@@ -316,7 +359,7 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(4)),
         );
 
-        assert_eq!(None, store.get(&BulkString::from_str("key")));
+        assert_eq!(Ok(None), store.get(&BulkString::from_str("key")));
     }
 
     #[tokio::test]
@@ -330,7 +373,7 @@ mod tests {
             Some(Instant::now() + Duration::from_secs(2)),
         );
         assert_eq!(
-            Some(BulkString::from_str("value3")),
+            Ok(Some(BulkString::from_str("value3"))),
             store.get(&BulkString::from_str("key"))
         );
         tokio::time::advance(Duration::from_secs(1)).await;
@@ -341,7 +384,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            Some(BulkString::from_str("value3")),
+            Ok(Some(BulkString::from_str("value3"))),
             store.get(&BulkString::from_str("key"))
         );
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -352,7 +395,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            Some(BulkString::from_str("value4")),
+            Ok(Some(BulkString::from_str("value4"))),
             store.get(&BulkString::from_str("key"))
         );
     }
@@ -389,13 +432,13 @@ mod tests {
 
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        assert!(store.get(&key1).is_none());
-        assert!(store.get(&key2).is_some());
+        assert!(store.get(&key1).unwrap().is_none());
+        assert!(store.get(&key2).unwrap().is_some());
 
         store.vacuum();
 
-        assert!(store.get(&key1).is_none());
-        assert!(store.get(&key2).is_some());
+        assert!(store.get(&key1).unwrap().is_none());
+        assert!(store.get(&key2).unwrap().is_some());
         {
             let state = store.state.lock().unwrap();
             assert!(state.data.get(&key1).is_none());
@@ -413,7 +456,7 @@ mod tests {
 
         store.vacuum();
 
-        assert!(store.get(&key2).is_some());
+        assert!(store.get(&key2).unwrap().is_some());
         {
             let state = store.state.lock().unwrap();
             assert!(state.data.get(&key2).is_some());
@@ -424,11 +467,46 @@ mod tests {
 
         store.vacuum();
 
-        assert!(store.get(&key2).is_none());
+        assert!(store.get(&key2).unwrap().is_none());
         {
             let state = store.state.lock().unwrap();
             assert!(state.data.get(&key2).is_none());
             assert_eq!(0, state.expiring_keys_queue.len());
         }
+    }
+
+    #[test]
+    fn test_append_to_list() {
+        let store = Store::new();
+
+        store.set(
+            BulkString::from_str("key"),
+            BulkString::from_str("value"),
+            None,
+        );
+
+        assert_eq!(
+            Err(OPERATION_ON_WRONG_TYPE),
+            store.append_to_list(
+                BulkString::from_str("key"),
+                vec![BulkString::from_str("item")]
+            )
+        );
+
+        assert_eq!(
+            Ok(1),
+            store.append_to_list(
+                BulkString::from_str("list1"),
+                vec![BulkString::from_str("item1")]
+            )
+        );
+
+        assert_eq!(
+            Ok(3),
+            store.append_to_list(
+                BulkString::from_str("list1"),
+                vec![BulkString::from_str("item2"), BulkString::from_str("item3")]
+            )
+        );
     }
 }
