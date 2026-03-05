@@ -1,5 +1,8 @@
-use crate::resp::{RespCodec, RespCommand, SetCmdCondition, SetCmdExpiry};
+use crate::error::{Error, RespError};
 use crate::store::Store;
+use resp::cmd::{RespCommand, SetCmdCondition, SetCmdExpiry};
+use resp::codec::RespCodec;
+use resp::types::RespVal;
 use std::io::{self};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -63,56 +66,65 @@ async fn handle_connection(stream: &mut TcpStream, store: Store) -> io::Result<(
     let mut codec = RespCodec::new(reader, writer);
 
     loop {
-        let command = match codec.read_command().await? {
-            Some(cmd) => cmd,
-            None => {
+        match codec.read_command().await {
+            Ok(Some(command)) => {
+                println!("Got command {:?}", command);
+                match process_command(&store, command) {
+                    Ok(resp_type) => codec.write_resp_val(resp_type).await?,
+                    Err(error) => codec.write_err(error).await?,
+                }
+
+                codec.flush().await?;
+            }
+            Ok(None) => {
                 return Ok(());
             }
+            Err(Error::RespError(resp_error)) => {
+                codec.write_err(resp_error).await?;
+                codec.flush().await?
+            }
+            Err(Error::IoError(io_error)) => Err(io_error)?,
         };
+    }
+}
 
-        println!("Got command {:?}", command);
-        match command {
-            RespCommand::Echo { message } => codec.write_bulk_str(message).await?,
-            RespCommand::Ping { message } => {
-                match message {
-                    Some(message) => codec.write_bulk_str(message).await?,
-                    None => codec.write_simple_str("PONG").await?,
-                };
-            }
-            RespCommand::Set {
-                key,
-                value,
-                condition,
-                expiry,
-            } => {
-                let expires_at = expiry.map(|expiry| match expiry {
-                    SetCmdExpiry::TimeToLive { millis } => {
-                        Instant::now() + Duration::from_millis(millis)
-                    }
-                });
-
-                match condition {
-                    Some(SetCmdCondition::UnlessKeyExists) => {
-                        store.set_unless_exists(key, value, expires_at);
-                    }
-                    Some(SetCmdCondition::IfKeyExists) => {
-                        store.set_if_exists(key, value, expires_at);
-                    }
-                    None => {
-                        store.set(key, value, expires_at);
-                    }
+fn process_command(store: &Store, command: RespCommand) -> Result<RespVal, RespError> {
+    match command {
+        RespCommand::Echo { message } => Ok(RespVal::BulkString(message)),
+        RespCommand::Ping { message } => match message {
+            Some(message) => Ok(RespVal::BulkString(message)),
+            None => Ok(RespVal::SimpleString(String::from("PONG"))),
+        },
+        RespCommand::Set {
+            key,
+            value,
+            condition,
+            expiry,
+        } => {
+            let expires_at = expiry.map(|expiry| match expiry {
+                SetCmdExpiry::TimeToLive { millis } => {
+                    Instant::now() + Duration::from_millis(millis)
                 }
-                codec.write_simple_str("OK").await?;
+            });
+
+            match condition {
+                Some(SetCmdCondition::UnlessKeyExists) => {
+                    store.set_unless_exists(key, value, expires_at);
+                }
+                Some(SetCmdCondition::IfKeyExists) => {
+                    store.set_if_exists(key, value, expires_at);
+                }
+                None => {
+                    store.set(key, value, expires_at);
+                }
             }
-            RespCommand::Get { key } => match store.get(&key) {
-                Ok(value) => codec.write_bulk_str_opt(value).await?,
-                Err(err) => codec.write_err(err).await?,
-            },
-            RespCommand::RPush { key, elements } => match store.append_to_list(key, elements) {
-                Ok(list_size) => codec.write_usize(list_size).await?,
-                Err(err) => codec.write_err(err).await?,
-            },
+            Ok(RespVal::SimpleString(String::from("OK")))
         }
-        codec.flush().await?;
+        RespCommand::Get { key } => store
+            .get(&key)
+            .map(|opt_val| opt_val.map_or(RespVal::Null, |val| RespVal::BulkString(val))),
+        RespCommand::RPush { key, elements } => store
+            .append_to_list(key, elements)
+            .map(|list_size| RespVal::Integer(list_size.try_into().unwrap())),
     }
 }

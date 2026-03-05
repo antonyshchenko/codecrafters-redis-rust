@@ -2,8 +2,8 @@ use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
 use tokio::time::Instant;
 
-use crate::error::{Error, OPERATION_ON_WRONG_TYPE};
-use crate::resp::BulkString;
+use crate::error::{OPERATION_ON_WRONG_TYPE, RespError};
+use crate::resp::types::BulkString;
 use std::collections::{BinaryHeap, HashMap};
 use std::sync::{Arc, Mutex};
 
@@ -89,7 +89,7 @@ impl StoreState {
         };
     }
 
-    fn get(&self, key: &Key) -> Result<Option<BulkString>, Error> {
+    fn get(&self, key: &Key) -> Result<Option<BulkString>, RespError> {
         self.data
             .get(key)
             .take_if(|existing_value| {
@@ -111,7 +111,11 @@ impl StoreState {
         }
     }
 
-    fn append_to_list(&mut self, key: Key, mut elements: Vec<BulkString>) -> Result<usize, Error> {
+    fn append_to_list(
+        &mut self,
+        key: Key,
+        mut elements: Vec<BulkString>,
+    ) -> Result<usize, RespError> {
         Ok(match self.data.entry(key) {
             Entry::Occupied(mut entry) => {
                 let existing_value_with_ttl = entry.get_mut();
@@ -193,11 +197,11 @@ impl Store {
             .set_unless_exists(key, value, expires_at);
     }
 
-    pub fn get(&self, key: &Key) -> Result<Option<BulkString>, Error> {
+    pub fn get(&self, key: &Key) -> Result<Option<BulkString>, RespError> {
         self.state.lock().unwrap().get(key)
     }
 
-    pub fn append_to_list(&self, key: Key, elements: Vec<BulkString>) -> Result<usize, Error> {
+    pub fn append_to_list(&self, key: Key, elements: Vec<BulkString>) -> Result<usize, RespError> {
         self.state.lock().unwrap().append_to_list(key, elements)
     }
 

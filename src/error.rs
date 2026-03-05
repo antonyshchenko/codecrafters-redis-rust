@@ -1,8 +1,22 @@
-#[derive(Debug, PartialEq)]
+use tokio::io;
+
+#[derive(Debug)]
 pub enum Error {
-    WrongType(&'static str),
-    Generic(&'static str),
+    IoError(io::Error),
+    RespError(RespError),
 }
 
-pub const OPERATION_ON_WRONG_TYPE: Error =
-    Error::WrongType("Operation against a key holding the wrong kind of value");
+impl Error {
+    pub fn resp_generic(msg: &str) -> Error {
+        Error::RespError(RespError::Generic(String::from(msg)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum RespError {
+    WrongType(&'static str),
+    Generic(String),
+}
+
+pub const OPERATION_ON_WRONG_TYPE: RespError =
+    RespError::WrongType("Operation against a key holding the wrong kind of value");
